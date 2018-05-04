@@ -298,6 +298,11 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
         //MP_VERBOSE(ao, "playbackHeadPosition = %u (reset_pending=%d)\n", pos, p->reset_pending);
     }
 
+    if (p->format == AudioFormat.ENCODING_AC3) {
+        // convert android's frame position to a byte position, since mpv and the rest
+        // of this driver operate in terms of bytes.
+        pos = (uint64_t)pos * (ao->bitrate / 8) / ao->samplerate;
+    }
 
     if (p->format == AudioFormat.ENCODING_IEC61937) {
         if (p->reset_pending) {
@@ -402,7 +407,9 @@ static int init(struct ao *ao)
     if (init_jni(ao) < 0)
         return -1;
 
-    if (af_fmt_is_spdif(ao->format)) {
+    if (ao->format == AF_FORMAT_R_AC3) {
+        p->format = AudioFormat.ENCODING_AC3;
+    } else if (af_fmt_is_spdif(ao->format)) {
         p->format = AudioFormat.ENCODING_IEC61937;
     } else if (ao->format == AF_FORMAT_U8) {
         p->format = AudioFormat.ENCODING_PCM_8BIT;
@@ -414,7 +421,7 @@ static int init(struct ao *ao)
         p->format = AudioFormat.ENCODING_PCM_16BIT;
     }
 
-    if (AudioTrack.getNativeOutputSampleRate) {
+    if (AudioTrack.getNativeOutputSampleRate && p->format != AudioFormat.ENCODING_AC3) {
         jint samplerate = MP_JNI_CALL_STATIC_INT(
             AudioTrack.clazz,
             AudioTrack.getNativeOutputSampleRate,
@@ -434,6 +441,8 @@ static int init(struct ao *ao)
         ao->channels = (struct mp_chmap)MP_CHMAP6(FL, FR, FC, LFE, BL, BR);
     } else if (p->format == AudioFormat.ENCODING_IEC61937) {
         p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
+    } else if (p->format == AudioFormat.ENCODING_AC3) {
+        p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
     } else {
         p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
         ao->channels = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
@@ -448,9 +457,15 @@ static int init(struct ao *ao)
         MP_FATAL(ao, "AudioTrack.getMinBufferSize returned an invalid size: %d", buffer_size);
         return -1;
     }
-    int min = 0.25 * p->samplerate * af_fmt_to_bytes(ao->format) * ao->channels.num;
-    int max = min * 2;
-    p->size = MPCLAMP(buffer_size * 4, min, max);
+    int min = 0, max = 0;
+    if (p->format == AudioFormat.ENCODING_AC3) {
+        // 250ms @ 640kbps
+        p->size = 0.25 * 640000 / 8;
+    } else {
+        min = 0.25 * p->samplerate * af_fmt_to_bytes(ao->format) * ao->channels.num;
+        max = min * 2;
+        p->size = MPCLAMP(buffer_size * 4, min, max);
+    }
     MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
 
     jobject timestamp = MP_JNI_NEW(AudioTimestamp.clazz, AudioTimestamp.ctor);
@@ -516,6 +531,8 @@ static int get_space(struct ao *ao)
     int frames = p->size / ao->sstride;
     if (p->format == AudioFormat.ENCODING_IEC61937 && playhead == 0)
         return frames;
+    if (p->format == AudioFormat.ENCODING_AC3 && playhead == 0)
+        return frames;
     uint32_t diff = p->written_frames - playhead;
     if (diff > frames && p->eof_reached)
         return frames;
@@ -532,8 +549,8 @@ static double get_delay(struct ao *ao)
     uint32_t diff = p->written_frames - playhead;
     if (diff > frames && p->eof_reached)
         return 0;
-    double delay = diff / (double)ao->samplerate;
-    if (!p->timestamp_set && p->format != AudioFormat.ENCODING_IEC61937)
+    double delay = diff / (double)(p->format == AudioFormat.ENCODING_AC3 ? ao->bitrate/8 : ao->samplerate);
+    if (!p->timestamp_set && p->format != AudioFormat.ENCODING_IEC61937 && p->format != AudioFormat.ENCODING_AC3)
         delay += AudioTrack_getLatency(ao);
     if (delay > 1.0) {
         //MP_WARN(ao, "get_delay: written=%u playhead=%u diff=%u delay=%f\n", p->written_frames, playhead, diff, delay);
